@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
+from axle_seal_guard import seal_axle_coherent
 from db import connect, now_iso, write_audit
 from models import BridgeIn
 
@@ -39,10 +40,27 @@ def get_bridge(bridge_id: int, authorization: AuthHeader = None):
                WHERE l.bridge_id=? AND t.status NOT IN ('作废','已封闸')""",
             (bridge_id,),
         ).fetchone()
+        seal_rows = conn.execute(
+            """SELECT s.id, s.ticket_id FROM gate_seals s
+               JOIN weigh_tickets t ON t.id=s.ticket_id
+               JOIN weigh_lanes l ON l.id=t.lane_id
+               WHERE l.bridge_id=? AND s.status='已封闸'
+                 AND s.id = (SELECT MAX(x.id) FROM gate_seals x
+                             WHERE x.ticket_id=s.ticket_id AND x.status='已封闸')""",
+            (bridge_id,),
+        ).fetchall()
+        incoherent = [
+            s["id"] for s in seal_rows if not seal_axle_coherent(conn, s["ticket_id"])
+        ]
         return {
             "bridge": dict(row),
             "lanes": [dict(x) for x in lanes],
             "active_tickets": stats["active"],
+            "seal_axle": {
+                "sealed": len(seal_rows),
+                "incoherent": len(incoherent),
+                "incoherent_seal_ids": incoherent,
+            },
         }
 
 

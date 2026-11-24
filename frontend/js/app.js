@@ -41,6 +41,8 @@ createApp({
     const reconOne = ref(null);
     const reconAllItems = ref([]);
     const proofOne = ref(null);
+    const conformance = ref({});
+    const axleDraftInput = ref('[{"axle":1,"w":13.5},{"axle":2,"w":14.0}]');
     const reconCode = ref("BL-2026-0101");
     const proofCode = ref("WT-LN-N-01-IN-001");
 
@@ -122,14 +124,62 @@ createApp({
       await refresh();
     }
 
-    async function refresh() {
-      if (!token.value) return;
+    const replayAction = async (fn, msg) => {
+      clearFlash();
+      try { await fn(); flashOk(msg); await refresh(); }
+      catch (e) { flashErr(e); }
+    };
+    function sealAxleCoherent(s) {
+      const c = conformance.value;
+      if (!c || !c.incoherent_seals) return true;
+      return !c.incoherent_seals.some((x) => x.seal_ref === s.seal_ref);
+    }
+    async function reviseAxles(ticketId, axleWeights, draft, note) {
+      await replayAction(
+        () => api.reviseAxles(ticketId, { axle_weights: axleWeights, draft, note }),
+        draft ? "影子草稿已落" : "轴重已修订"
+      );
+    }
+    async function submitAxleDraft(ticketId) {
+      let axles;
+      try { axles = JSON.parse(axleDraftInput.value || "[]"); }
+      catch (e) { flashErr(new Error("轴重 JSON 解析失败")); return; }
       clearFlash();
       try {
-        const [d, br, ln, tk, ov, gr, sl, bl, lg, cj, cj2] = await Promise.all([
+        const r = await api.reviseAxles(ticketId, {
+          axle_weights: axles, draft: true, note: "页面封后修订（影子草稿）",
+        });
+        flashOk(`影子草稿 #${r.draft_id} 已落，待解封校验`);
+        ticketDetail.value = await api.ticket(ticketId);
+        await refresh();
+      } catch (e) { flashErr(e); }
+    }
+    async function promoteDraft(draftId) {
+      await replayAction(() => api.promoteDraft(draftId), "影子草稿已原子晋升");
+      if (ticketDetail.value) {
+        ticketDetail.value = await api.ticket(ticketDetail.value.ticket.id);
+      }
+    }
+    async function unsealSeal(sealRef, note) {
+      await replayAction(() => api.unseal(sealRef, { note }), "已解封校验");
+      if (ticketDetail.value) {
+        ticketDetail.value = await api.ticket(ticketDetail.value.ticket.id);
+      }
+    }
+    async function loadConformance() {
+      clearFlash();
+      try { conformance.value = await api.axleConformance(); }
+      catch (e) { flashErr(e); }
+    }
+
+    async function refresh() {
+      if (!token.value) return;
+      // 不清闪屏：动作提示（flashOk/flashErr）由动作自己管理，刷新不得抹掉
+      try {
+        const [d, br, ln, tk, ov, gr, sl, bl, lg, cj, cj2, cf] = await Promise.all([
           api.dashboard(), api.bridges(), api.lanes(), api.tickets(), api.overloads(),
           api.gateReleases(), api.seals(), api.blList(), api.lineage(),
-          api.customsJobs(), api.craneJobs(),
+          api.customsJobs(), api.craneJobs(), api.axleConformance(),
         ]);
         dash.value = d || {};
         bridges.value = br.items || [];
@@ -142,6 +192,7 @@ createApp({
         lineageEdges.value = lg.items || [];
         customsJobs.value = cj.items || [];
         craneJobs.value = cj2.items || [];
+        conformance.value = cf || {};
         if (bridges.value.length) {
           laneForm.value.bridge_id = laneForm.value.bridge_id || bridges.value[0].id;
         }
@@ -264,6 +315,8 @@ createApp({
       dash, bridges, lanes, tickets, overloads, gateReleases, seals, blList,
       lineageEdges, customsJobs, craneJobs, bridgeDetail, ticketDetail,
       reconOne, reconAllItems, proofOne, reconCode, proofCode,
+      conformance, sealAxleCoherent, reviseAxles, promoteDraft, unsealSeal, loadConformance,
+      axleDraftInput, submitAxleDraft,
       bridgeForm, laneForm, ticketForm, overloadOpenForm, gateForm, sealForm,
       blForm, lineageForm, customsForm, craneForm,
       adjudicableTickets, releasableTickets, sealableTickets,

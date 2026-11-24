@@ -30,6 +30,12 @@ export const bridgesViewTemplate = `
   <div v-if="bridgeDetail" class="detail-box">
     <h3>{{ bridgeDetail.bridge.name }} · {{ bridgeDetail.bridge.bridge_code }}</h3>
     <p>在港票 {{ bridgeDetail.active_tickets }} · 车道 {{ bridgeDetail.lanes.length }} 条</p>
+    <p v-if="bridgeDetail.seal_axle">
+      封闸 {{ bridgeDetail.seal_axle.sealed }} ·
+      <span :class="bridgeDetail.seal_axle.incoherent ? 'recon-warn' : 'recon-ok'">
+        封后轴重偏航 {{ bridgeDetail.seal_axle.incoherent }}
+      </span>
+    </p>
   </div>
 </section>
 `;

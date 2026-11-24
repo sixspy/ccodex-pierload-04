@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 
 from audit_svc import router as audit_router
 from auth import router as auth_router
+from axle_draft_svc import router as axle_draft_router
 from axle_lineage_svc import router as lineage_router
 from bl_svc import router as bl_router
 from bridges_svc import router as bridges_router
@@ -44,6 +45,7 @@ for r in (
     seal_router,
     bl_router,
     lineage_router,
+    axle_draft_router,
     reconcile_router,
     locks_router,
     audit_router,

@@ -35,6 +35,14 @@ class TicketIn(BaseModel):
     ticket_code: str | None = None
 
 
+class AxleReviseIn(BaseModel):
+    """封后轴重修订：draft=false 走甲路径（拒写）；draft=true 走乙路径（影子草稿）。"""
+
+    axle_weights: list[AxleWeight]
+    draft: bool = False
+    note: str = ""
+
+
 class OverloadOpenIn(BaseModel):
     ticket_id: int
     threshold_t: float | None = None
@@ -68,6 +76,7 @@ class LineageIn(BaseModel):
     to_ticket_id: int | None = None
     edge_type: str
     detail: str
+    draft_id: int | None = None
 
 
 class StubJobIn(BaseModel):

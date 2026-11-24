@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user
+from axle_seal_guard import seal_axle_audit, seal_axle_coherent
 from validators import validate_bl_match
 
 router = APIRouter(tags=["reconcile"])
@@ -60,18 +61,33 @@ def _reconcile_bl(conn, bl_code: str) -> dict:
     declared = float(bl["declared_gross_t"])
     matched = validate_bl_match(declared, ticket_sum, tolerance=0.1)
     seal_rows = conn.execute(
-        """SELECT s.seal_ref, s.ticket_generation, t.ticket_code
+        """SELECT s.id, s.seal_ref, s.ticket_generation, t.ticket_code, t.id ticket_id
            FROM gate_seals s JOIN weigh_tickets t ON t.id=s.ticket_id
-           WHERE t.bl_ref=?""",
+           WHERE t.bl_ref=? AND s.status='已封闸'
+             AND s.id = (SELECT MAX(x.id) FROM gate_seals x
+                         WHERE x.ticket_id=s.ticket_id AND x.status='已封闸')""",
         (bl_code,),
     ).fetchall()
-    proof_ok = matched and len(seal_rows) >= 1
+    seal_coherent = all(
+        seal_axle_coherent(conn, s["ticket_id"]) for s in seal_rows
+    )
+    proof_ok = matched and len(seal_rows) >= 1 and seal_coherent
+    if not seal_rows:
+        reason = "无闸代快照" if matched else "毛重与提单不符"
+    elif not seal_coherent:
+        reason = "封后轴重偏航"
+    elif not matched:
+        reason = "毛重与提单不符"
+    else:
+        reason = "账实平衡"
     return {
         "bl_code": bl_code,
         "declared_gross_t": declared,
         "ticket_sum_t": ticket_sum,
-        "balanced": matched,
+        "balanced": matched and seal_coherent,
+        "gate_seal_coherent": seal_coherent,
         "proof_ready": proof_ok,
+        "reason": reason,
         "seal_count": len(seal_rows),
         "tickets": [dict(t) for t in tickets],
         "seals": [dict(s) for s in seal_rows],
@@ -93,7 +109,8 @@ def proof_ticket(ticket_code: str, authorization: AuthHeader = None):
             "SELECT * FROM bl_manifests WHERE bl_code=?", (ticket["bl_ref"],)
         ).fetchone()
         seal = conn.execute(
-            """SELECT * FROM gate_seals WHERE ticket_id=? ORDER BY id DESC LIMIT 1""",
+            """SELECT * FROM gate_seals WHERE ticket_id=? AND status='已封闸'
+               ORDER BY id DESC LIMIT 1""",
             (ticket["id"],),
         ).fetchone()
         release = conn.execute(
@@ -104,6 +121,7 @@ def proof_ticket(ticket_code: str, authorization: AuthHeader = None):
             """SELECT id FROM overload_holds WHERE ticket_id=? AND status='开放'""",
             (ticket["id"],),
         ).fetchone()
+        seal_coherent = seal_axle_coherent(conn, ticket["id"], seal)
         manifest_match = False
         if seal and bl:
             manifest_match = validate_bl_match(
@@ -116,9 +134,20 @@ def proof_ticket(ticket_code: str, authorization: AuthHeader = None):
             "manifest_matches_bl": manifest_match,
             "has_seal": seal is not None,
             "seal_generation": seal["ticket_generation"] if seal else None,
+            "seal_axle_coherent": seal_coherent,
             "released": release is not None,
             "overload_closed": overload_closed,
             "coherent": bool(
-                manifest_match and overload_closed and (seal or release)
+                manifest_match and overload_closed and (seal or release) and seal_coherent
             ),
         }
+
+
+@router.get("/api/axle-conformance")
+def axle_conformance(authorization: AuthHeader = None):
+    """五页同态核：快照/过磅/血缘/对账/地磅 共用一份封后轴重偏航结果。"""
+    require_user(authorization)
+    from db import connect
+
+    with connect() as conn:
+        return seal_axle_audit(conn)

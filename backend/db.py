@@ -30,6 +30,21 @@ PRODUCT_META = {
     "stubs": ["customs_stub", "crane_plan"],
 }
 
+# —— 封后轴重纪要（当班封死）——
+# 甲路径：闸代生效后正式轴重表一律零改并当场拒写。
+# 乙路径：封后修订仅许写入影子轴重草稿，待解封校验通过后原子晋升，正式表晋升前零改。
+# 两边不得混用；折中路不留。
+POST_SEAL_RULING = {
+    "code": "封后轴重纪要",
+    "case": "封后案丁 · 第4号",
+    "paths": {"甲": "正式表零改并当场拒写", "乙": "影子草稿待解封校验后原子晋升"},
+    "violation": "封后轴重偏航",
+    "note": "当班封死；偏离纪要即记封后轴重偏航并拒写",
+}
+DIRECT_WRITE_REFUSED = "封后轴重禁改：闸代已生效，正式轴重表零改（封后案丁）"
+DRAFT_REQUIRED = "封后修订须走乙路径：仅许写入影子轴重草稿，正式表零改"
+SHADOW_PROMOTE_MISUSE = "封后轴重偏航：非封态票不得走影子草稿晋升"
+
 
 def connect() -> sqlite3.Connection:
     DATA.mkdir(parents=True, exist_ok=True)
@@ -123,6 +138,8 @@ CREATE TABLE IF NOT EXISTS gate_seals(
   seal_ref TEXT NOT NULL,
   status TEXT NOT NULL,
   sealed_at TEXT NOT NULL,
+  axle_weights TEXT,
+  gross_t REAL,
   FOREIGN KEY(ticket_id) REFERENCES weigh_tickets(id)
 );
 CREATE TABLE IF NOT EXISTS bl_manifests(
@@ -141,7 +158,44 @@ CREATE TABLE IF NOT EXISTS axle_lineage(
   edge_type TEXT NOT NULL,
   detail TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  draft_id INTEGER,
+  state TEXT NOT NULL DEFAULT '正式',
   FOREIGN KEY(from_ticket_id) REFERENCES weigh_tickets(id)
+);
+CREATE TABLE IF NOT EXISTS axle_drafts(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id INTEGER NOT NULL,
+  seal_id INTEGER,
+  axle_weights TEXT NOT NULL,
+  gross_t REAL NOT NULL,
+  status TEXT NOT NULL,
+  note TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  promoted_at TEXT,
+  FOREIGN KEY(ticket_id) REFERENCES weigh_tickets(id),
+  FOREIGN KEY(seal_id) REFERENCES gate_seals(id)
+);
+CREATE TABLE IF NOT EXISTS seal_unseals(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  seal_id INTEGER NOT NULL,
+  seal_ref TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  note TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(seal_id) REFERENCES gate_seals(id)
+);
+CREATE TABLE IF NOT EXISTS post_seal_axle_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id INTEGER NOT NULL,
+  seal_id INTEGER,
+  actor TEXT NOT NULL,
+  attempted TEXT NOT NULL,
+  outcome TEXT NOT NULL,
+  ruling_path TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(ticket_id) REFERENCES weigh_tickets(id)
 );
 CREATE TABLE IF NOT EXISTS pier_locks(
   lock_key TEXT PRIMARY KEY,
@@ -382,7 +436,7 @@ def seed_gate_samples(conn: sqlite3.Connection) -> None:
 def seed_seals_sample(conn: sqlite3.Connection) -> None:
     for row in _load_json("gate_seals.json"):
         ticket = conn.execute(
-            "SELECT id, generation FROM weigh_tickets WHERE ticket_code=?",
+            "SELECT id, generation, axle_weights, gross_t FROM weigh_tickets WHERE ticket_code=?",
             (row["ticket_code"],),
         ).fetchone()
         if not ticket:
@@ -391,9 +445,18 @@ def seed_seals_sample(conn: sqlite3.Connection) -> None:
             "SELECT id FROM gate_seals WHERE seal_ref=?", (row["seal_ref"],)
         ).fetchone():
             continue
+        # 快照列取封闸当刻的票面轴重/毛重（夹具未给则用当前票面）
+        snap_axles = row.get("axle_weights")
+        snap_gross = row.get("gross_t")
+        if snap_gross is None:
+            snap_gross = float(ticket["gross_t"])
+        if snap_axles is None:
+            snap_axles = ticket["axle_weights"]
+        if not isinstance(snap_axles, str):
+            snap_axles = json.dumps(snap_axles, ensure_ascii=False)
         conn.execute(
-            """INSERT INTO gate_seals(ticket_id,ticket_generation,manifest,seal_ref,status,sealed_at)
-               VALUES (?,?,?,?,?,?)""",
+            """INSERT INTO gate_seals(ticket_id,ticket_generation,manifest,seal_ref,
+               status,sealed_at,axle_weights,gross_t) VALUES (?,?,?,?,?,?,?,?)""",
             (
                 ticket["id"],
                 int(row.get("ticket_generation", ticket["generation"])),
@@ -401,6 +464,8 @@ def seed_seals_sample(conn: sqlite3.Connection) -> None:
                 row["seal_ref"],
                 row.get("status", "已封闸"),
                 row["sealed_at"],
+                snap_axles,
+                float(snap_gross),
             ),
         )
 
@@ -436,9 +501,76 @@ def seed_lineage_samples(conn: sqlite3.Connection) -> None:
         )
 
 
+def _ensure_columns(conn: sqlite3.Connection) -> None:
+    """老库迁移：CREATE TABLE IF NOT EXISTS 不会补列，须显式加。"""
+    wanted = {
+        "gate_seals": {
+            "axle_weights": "TEXT",
+            "gross_t": "REAL",
+        },
+        "axle_lineage": {
+            "draft_id": "INTEGER",
+            "state": "TEXT NOT NULL DEFAULT '正式'",
+        },
+    }
+    for table, cols in wanted.items():
+        existing = {
+            r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        for name, decl in cols.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _manifest_gross(manifest: str | None) -> float | None:
+    """从封闸清单里取封闸当刻毛重（清单是封闸时写死的权威口径）。"""
+    if not manifest:
+        return None
+    for part in manifest.replace("；", ";").split(";"):
+        if part.startswith("毛重="):
+            try:
+                return float(part[len("毛重="):].rstrip("tT吨"))
+            except ValueError:
+                return None
+    return None
+
+
+def _backfill_seal_snapshots(conn: sqlite3.Connection) -> None:
+    """迁移来的老快照没有轴重快照列：按清单毛重回填封闸口径。
+
+    清单毛重与当前票面一致 → 票面即封闸面，可回填轴重；
+    不一致（封后已被硬改）→ 轴重留空，判同态不可证明，由对账核出偏航。
+    历史坏行因此不会被洗白。
+    """
+    rows = conn.execute(
+        """SELECT s.id, s.ticket_id, s.ticket_generation, s.manifest,
+                  t.generation, t.axle_weights, t.gross_t
+           FROM gate_seals s JOIN weigh_tickets t ON t.id=s.ticket_id
+           WHERE s.axle_weights IS NULL OR s.gross_t IS NULL"""
+    ).fetchall()
+    for r in rows:
+        snap_gross = _manifest_gross(r["manifest"])
+        if snap_gross is None:
+            if int(r["generation"]) != int(r["ticket_generation"]):
+                # 票面已升代且清单无毛重：无法还原，留空待人工核
+                continue
+            snap_gross = float(r["gross_t"])
+        face_gross = float(r["gross_t"])
+        coherent_face = abs(round(face_gross, 3) - round(snap_gross, 3)) <= 0.001
+        conn.execute(
+            "UPDATE gate_seals SET axle_weights=?, gross_t=? WHERE id=?",
+            (
+                r["axle_weights"] if coherent_face else None,
+                snap_gross,
+                r["id"],
+            ),
+        )
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _ensure_columns(conn)
         seed_users(conn)
         seed_bridges(conn)
         seed_lanes(conn)
@@ -447,6 +579,7 @@ def init_db() -> None:
         seed_overloads(conn)
         seed_gate_samples(conn)
         seed_seals_sample(conn)
+        _backfill_seal_snapshots(conn)
         seed_lineage_samples(conn)
         conn.commit()
 

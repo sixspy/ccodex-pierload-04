@@ -6,15 +6,24 @@ import json
 from fastapi import APIRouter, HTTPException
 
 from auth import AuthHeader, require_user, require_writer
-from db import connect, now_iso, write_audit
+from axle_seal_guard import (
+    active_seal,
+    axle_json,
+    is_sealed,
+    log_deviation,
+    refuse_formal_write,
+    ticket_axle_state,
+)
+from db import DRAFT_REQUIRED, connect, now_iso, write_audit
 from locks import release, require_lock
-from models import TicketIn
+from models import AxleReviseIn, TicketIn
 from validators import (
     adjudicate_overload,
     validate_axle_count,
     validate_axle_weights,
     validate_gross_cap,
     validate_lane_open,
+    validate_ticket_mutable,
 )
 
 router = APIRouter(tags=["tickets"])
@@ -80,12 +89,30 @@ def get_ticket(ticket_id: int, authorization: AuthHeader = None):
             "SELECT * FROM gate_releases WHERE ticket_id=? ORDER BY id DESC",
             (ticket_id,),
         ).fetchall()
+        drafts = conn.execute(
+            """SELECT * FROM axle_drafts WHERE ticket_id=? ORDER BY id DESC""",
+            (ticket_id,),
+        ).fetchall()
+        deviations = conn.execute(
+            """SELECT * FROM post_seal_axle_log WHERE ticket_id=?
+               ORDER BY id DESC LIMIT 50""",
+            (ticket_id,),
+        ).fetchall()
         return {
             "ticket": data,
             "overload_holds": [dict(h) for h in holds],
             "gate_seals": [dict(s) for s in seals],
             "gate_releases": [dict(r) for r in releases],
+            "axle_state": ticket_axle_state(conn, data),
+            "axle_drafts": [_draft_row(d) for d in drafts],
+            "axle_deviations": [dict(d) for d in deviations],
         }
+
+
+def _draft_row(row) -> dict:
+    d = dict(row)
+    d["axle_weights"] = json.loads(d["axle_weights"] or "[]")
+    return d
 
 
 @router.post("/api/tickets")
@@ -177,6 +204,109 @@ def create_ticket(body: TicketIn, authorization: AuthHeader = None):
                 "gross_t": gross,
                 "status": status,
                 "overload": is_over,
+            }
+        finally:
+            release(conn, lock_key, user)
+
+
+@router.post("/api/tickets/{ticket_id}/axles")
+def revise_axles(ticket_id: int, body: AxleReviseIn, authorization: AuthHeader = None):
+    """封后轴重修订：甲路径当场拒写；乙路径只落影子草稿。两边不得混用。"""
+    user = require_writer(authorization)
+    lock_key = f"ticket:{ticket_id}"
+    with connect() as conn:
+        require_lock(conn, lock_key, user)
+        try:
+            ticket = conn.execute(
+                """SELECT t.*, b.axle_limit FROM weigh_tickets t
+                   JOIN weigh_lanes l ON l.id=t.lane_id
+                   JOIN weigh_bridges b ON b.id=l.bridge_id
+                   WHERE t.id=?""",
+                (ticket_id,),
+            ).fetchone()
+            if not ticket:
+                raise HTTPException(404, "过磅票不存在")
+            seal = active_seal(conn, ticket_id)
+            sealed = is_sealed(dict(ticket), seal)
+
+            axles = [a.model_dump() for a in body.axle_weights]
+            gross, _peak, _spread = validate_axle_weights(axles)
+
+            if body.draft:
+                if not sealed:
+                    log_deviation(
+                        conn,
+                        ticket_id,
+                        seal["id"] if seal else None,
+                        user,
+                        "影子草稿",
+                        "封后轴重偏航",
+                        "乙",
+                        "非封态票走影子草稿",
+                    )
+                    conn.commit()
+                    raise HTTPException(409, DRAFT_REQUIRED)
+                cur = conn.execute(
+                    """INSERT INTO axle_drafts(ticket_id,seal_id,axle_weights,gross_t,
+                       status,note,actor,created_at) VALUES (?,?,?,?,?,?,?,?)""",
+                    (
+                        ticket_id,
+                        seal["id"] if seal else None,
+                        axle_json(axles),
+                        gross,
+                        "待解封校验",
+                        body.note or "封后修订（影子草稿）",
+                        user,
+                        now_iso(),
+                    ),
+                )
+                write_audit(
+                    conn,
+                    user,
+                    "axle_draft",
+                    ticket["ticket_code"],
+                    {"draft_id": cur.lastrowid, "gross_t": gross, "path": "乙"},
+                )
+                conn.commit()
+                return {
+                    "draft_id": cur.lastrowid,
+                    "status": "待解封校验",
+                    "gross_t": gross,
+                    "axle_weights": axles,
+                    "path": "乙",
+                }
+
+            # 甲路径：封态票正式写回当场拒写，正式轴重零改
+            validate_axle_count(axles, int(ticket["axle_limit"]))
+            if sealed:
+                refuse_formal_write(
+                    conn,
+                    user,
+                    ticket_id,
+                    seal,
+                    "正式轴重写回",
+                    f"axes={len(axles)}; gross={gross}",
+                )
+
+            # 非封态票：正式的轴重修订（既有行为，须先过票态可变校验）
+            validate_ticket_mutable(dict(ticket))
+            conn.execute(
+                "UPDATE weigh_tickets SET axle_weights=?, gross_t=? WHERE id=?",
+                (axle_json(axles), gross, ticket_id),
+            )
+            write_audit(
+                conn,
+                user,
+                "axle_revise",
+                ticket["ticket_code"],
+                {"gross_t": gross},
+            )
+            conn.commit()
+            return {
+                "ticket_id": ticket_id,
+                "gross_t": gross,
+                "axle_weights": axles,
+                "path": "甲",
             }
         finally:
             release(conn, lock_key, user)
